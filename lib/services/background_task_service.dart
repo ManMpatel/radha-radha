@@ -1,9 +1,9 @@
 import 'dart:async';
+import 'package:audio_session/audio_session.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:just_audio/just_audio.dart';
 import '../core/constants/app_constants.dart';
 
-// Top-level entry point required by flutter_foreground_task
 @pragma('vm:entry-point')
 void startCallback() {
   FlutterForegroundTask.setTaskHandler(RadhaTaskHandler());
@@ -12,53 +12,90 @@ void startCallback() {
 class RadhaTaskHandler extends TaskHandler {
   final Map<String, Timer> _timers = {};
   final Map<String, AudioPlayer> _players = {};
+  final Set<String> _starting = {};
 
   @override
-  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {}
-
-  @override
-  Future<void> onRepeatEvent(DateTime timestamp) async {
-    // Main periodic heartbeat — timers handle their own scheduling
+  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
+    // ignore: avoid_print
+    print('[Radha] Task handler started');
+    // Configure audio session in THIS isolate
+    try {
+      final session = await AudioSession.instance;
+      await session.configure(const AudioSessionConfiguration(
+        avAudioSessionCategory: AVAudioSessionCategory.playback,
+        avAudioSessionCategoryOptions:
+            AVAudioSessionCategoryOptions.duckOthers,
+        avAudioSessionMode: AVAudioSessionMode.defaultMode,
+        avAudioSessionRouteSharingPolicy:
+            AVAudioSessionRouteSharingPolicy.defaultPolicy,
+        avAudioSessionSetActiveOptions: AVAudioSessionSetActiveOptions.none,
+        androidAudioAttributes: AndroidAudioAttributes(
+          contentType: AndroidAudioContentType.music,
+          flags: AndroidAudioFlags.none,
+          usage: AndroidAudioUsage.media,
+        ),
+        androidAudioFocusGainType: AndroidAudioFocusGainType.gain,
+        androidWillPauseWhenDucked: true,
+      ));
+      // ignore: avoid_print
+      print('[Radha] Audio session configured');
+    } catch (e) {
+      // ignore: avoid_print
+      print('[Radha] Audio session error: $e');
+    }
   }
 
   @override
+  Future<void> onRepeatEvent(DateTime timestamp) async {}
+
+  @override
   Future<void> onDestroy(DateTime timestamp) async {
-    _stopAllTimers();
-    for (final p in _players.values) {
-      await p.dispose();
-    }
-    _players.clear();
+    await _stopAllTimers();
   }
 
   @override
   void onReceiveData(Object data) {
-    if (data is Map<String, dynamic>) {
-      final action = data['action'] as String?;
-      switch (action) {
-        case 'start':
-          _startTimer(
-            data['id'] as String,
-            data['filePath'] as String,
-            data['intervalSeconds'] as int,
-          );
-          break;
-        case 'stop':
-          _stopTimer(data['id'] as String);
-          break;
-        case 'stopAll':
-          _stopAllTimers();
-          break;
-        case 'skipOnCall':
-          _handleCallStarted();
-          break;
-        case 'resumeAfterCall':
-          // Timers auto-resume; no extra action needed
-          break;
-      }
+    // ignore: avoid_print
+    print('[Radha] onReceiveData called, type=${data.runtimeType}, data=$data');
+
+    // FIX: data arrives as Map<Object?, Object?> from platform channel —
+    // NOT Map<String, dynamic>. Must use Map.from() to cast safely.
+    if (data is! Map) {
+      // ignore: avoid_print
+      print('[Radha] Unexpected data type: ${data.runtimeType}');
+      return;
+    }
+
+    final map = Map<String, dynamic>.from(data);
+    final action = map['action'] as String?;
+    // ignore: avoid_print
+    print('[Radha] Action received: $action');
+
+    switch (action) {
+      case 'start':
+        _startTimer(
+          map['id'] as String,
+          map['filePath'] as String,
+          map['intervalSeconds'] as int,
+        );
+        break;
+      case 'stop':
+        _stopTimer(map['id'] as String);
+        break;
+      case 'stopAll':
+        _stopAllTimers();
+        break;
+      case 'skipOnCall':
+        _handleCallStarted();
+        break;
+      case 'resumeAfterCall':
+        break;
     }
   }
 
   void _startTimer(String id, String filePath, int intervalSeconds) {
+    // ignore: avoid_print
+    print('[Radha] Starting timer: id=$id interval=${intervalSeconds}s');
     _stopTimer(id);
     _timers[id] = Timer.periodic(
       Duration(seconds: intervalSeconds),
@@ -66,47 +103,109 @@ class RadhaTaskHandler extends TaskHandler {
     );
   }
 
-  void _stopTimer(String id) {
+  Future<void> _stopTimer(String id) async {
     _timers[id]?.cancel();
     _timers.remove(id);
-    _players[id]?.stop();
-    _players[id]?.dispose();
-    _players.remove(id);
+    _starting.remove(id);
+    final player = _players.remove(id);
+    if (player != null) {
+      try {
+        await player.stop();
+        await player.dispose();
+      } catch (_) {}
+    }
   }
 
-  void _stopAllTimers() {
+  Future<void> _stopAllTimers() async {
     for (final t in _timers.values) {
       t.cancel();
     }
     _timers.clear();
+    _starting.clear();
+    final players = Map<String, AudioPlayer>.from(_players);
+    _players.clear();
+    for (final p in players.values) {
+      try {
+        await p.stop();
+        await p.dispose();
+      } catch (_) {}
+    }
   }
 
-  void _handleCallStarted() {
-    // Reset all timers — they will fire at their next interval after call ends
-    final entries = Map<String, Timer>.from(_timers);
-    for (final entry in entries.entries) {
-      entry.value.cancel();
+  Future<void> _handleCallStarted() async {
+    for (final t in _timers.values) {
+      t.cancel();
     }
     _timers.clear();
+    _starting.clear();
+    final players = Map<String, AudioPlayer>.from(_players);
+    _players.clear();
+    for (final p in players.values) {
+      try {
+        await p.stop();
+        await p.dispose();
+      } catch (_) {}
+    }
   }
 
   Future<void> _playAudio(String id, String filePath) async {
+    // ignore: avoid_print
+    print('[Radha] _playAudio called: id=$id');
+
+    if (_starting.contains(id)) {
+      // ignore: avoid_print
+      print('[Radha] Skipping — already starting: $id');
+      return;
+    }
+
     try {
+      _starting.add(id);
+
       final existing = _players[id];
-      if (existing != null && existing.playing) return;
+      if (existing != null && existing.playing) {
+        // ignore: avoid_print
+        print('[Radha] Skipping — already playing: $id');
+        return;
+      }
+
+      if (existing != null) {
+        _players.remove(id);
+        try {
+          await existing.stop();
+          await existing.dispose();
+        } catch (_) {}
+      }
+
+      final session = await AudioSession.instance;
+      await session.setActive(true);
 
       final player = AudioPlayer();
       _players[id] = player;
       await player.setFilePath(filePath);
       await player.play();
-      player.playerStateStream.listen((state) {
+      // ignore: avoid_print
+      print('[Radha] Playing audio: $filePath');
+
+      player.playerStateStream.listen((state) async {
         if (state.processingState == ProcessingState.completed) {
-          player.dispose();
-          if (_players[id] == player) _players.remove(id);
+          if (_players[id] == player) {
+            _players.remove(id);
+            try {
+              await player.dispose();
+            } catch (_) {}
+          }
         }
       });
-    } catch (_) {
-      _players.remove(id);
+    } catch (e) {
+      // ignore: avoid_print
+      print('[Radha] _playAudio error ($id): $e');
+      final p = _players.remove(id);
+      try {
+        await p?.stop();
+        await p?.dispose();
+      } catch (_) {}
+    } finally {
+      _starting.remove(id);
     }
   }
 }
@@ -146,7 +245,6 @@ class BackgroundTaskService {
   static Future<void> startService() async {
     await init();
     if (await FlutterForegroundTask.isRunningService) return;
-
     await FlutterForegroundTask.startService(
       notificationTitle: '',
       notificationText: '',
@@ -164,7 +262,8 @@ class BackgroundTaskService {
     FlutterForegroundTask.sendDataToTask(data);
   }
 
-  static void startRecordingTimer(String id, String filePath, int intervalSeconds) {
+  static void startRecordingTimer(
+      String id, String filePath, int intervalSeconds) {
     sendData({
       'action': 'start',
       'id': id,
@@ -188,5 +287,4 @@ class BackgroundTaskService {
   static void notifyCallEnded() {
     sendData({'action': 'resumeAfterCall'});
   }
-
 }
